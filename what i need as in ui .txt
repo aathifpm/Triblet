@@ -1,0 +1,52 @@
+Cricket Tournament
+Admin Interface:
+Tournament Setup & Management:
+1. Create Tournament – Admin can create a new tournament by selecƟng a name and
+type (knockout, league, or mixed format).
+2. Add Teams – Admin adds teams and assigns them to the tournament.
+3. Set Schedule & InstrucƟons – System auto-generates a match schedule based on the
+tournament format. Admin can edit if needed and provide addiƟonal instrucƟons.
+Match ExecuƟon:
+1. Start Match – Admin clicks a "Start Match" buƩon when the match begins.
+2. Toss SelecƟon Popup – Admin selects which team bats first.
+3. Opening Players SelecƟon – Team list pops up for selecƟng:
+o Openers (Striker & Non-Striker)
+o Bowler for the first over
+4. Live Match Control (Touch & Go System):
+o Admin has 5 visible acƟon buƩons:
+ 1 Run: Increases team and striker’s score, changes striker.
+ 2, 4, 6 Runs: Increases team and striker’s score; striker does not
+change.
+ Wicket: Pops up wicket type selecƟon (Bowled, Caught, Runout, LBW),
+increments bowler’s wicket count, then pops up the team list to select
+the next batsman.
+ Wide: Adds 1 run to team score, does not count in over.
+5. Over CompleƟon – AŌer 6 balls, a popup asks the admin to select the next bowler
+and striker automaƟcally changes.
+AddiƟonal Admin Features:
+ Auto-Save & Undo: Every input should be auto-saved, with an undo buƩon available     
+for last acƟon correcƟon.
+ Match Summary GeneraƟon: AŌer match compleƟon, an auto-generated match
+summary is displayed. 
+ Seamless Leaderboard IntegraƟon: Auto-updates tournament leaderboard with
+most runs, wickets, and sixes.
+User Interface:
+Home Screen:
+ Match Schedule & Countdown Timer – Displays upcoming matches and Ɵme leŌ for
+each match.
+ Live Match Access – Users can click on an ongoing match to view:
+o Squads of Both Teams
+o Live Scorecard (Similar to Cricbuzz)
+o Ball-by-Ball Commentary
+Leaderboards & StaƟsƟcs:
+ Tournament-wide stats showing:
+o Top Run Scorers
+o Top Wicket Takers
+o Most Sixes Hit
+UX Enhancements:
+ One-Tap Access: Users should be able to access schedules, live matches, and
+leaderboards with a single tap.
+ Minimalist & IntuiƟve UI: Interface should be similar to professional cricket apps for
+a familiar experience.
+  Live NoƟficaƟons: Updates on match start, milestones (e.g., half-century, wickets,
+last over). 
