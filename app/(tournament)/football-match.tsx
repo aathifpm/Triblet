@@ -21,8 +21,8 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { MaterialIcons, Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAuth } from '../context/AuthContext';
-// If the project isn't using react-native-toast-message, let's use Alert instead for notifications
-// import Toast from 'react-native-toast-message';
+import { db, realtimeDb } from '../firebase/config'; // Import realtimeDb from config
+import { ref, onValue, set, update, get } from 'firebase/database'; // R
 
 // Define match event types
 enum MatchEventType {
@@ -122,6 +122,14 @@ interface MatchEvent {
   timestamp: Date | any; // Can be JavaScript Date or Firestore timestamp
 }
 
+// Penalty Kick interface
+interface PenaltyKick {
+  teamId: string;
+  scored: boolean;
+  playerId?: string;
+  playerName?: string;
+}
+
 // Football match interface
 interface FootballMatch {
   id: string;
@@ -144,13 +152,14 @@ interface FootballMatch {
   weather?: string;
   result?: string; // Match result for display and database storage
   clockRunning: boolean;
+  secondHalfContinued?: boolean; // Add this new field
+  penaltyKicks?: PenaltyKick[]; // Add this field for tracking penalties
 }
 
 export default function FootballMatch() {
   const [match, setMatch] = useState<FootballMatch | null>(null);
   const [loading, setLoading] = useState(true);
   const [clockRunning, setClockRunning] = useState(false);
-  const [clockInterval, setClockInterval] = useState<NodeJS.Timeout | null>(null);
   const [lastUpdateTime, setLastUpdateTime] = useState<number>(0);
   const [eventModalVisible, setEventModalVisible] = useState(false);
   const [eventType, setEventType] = useState<MatchEventType>(MatchEventType.GOAL);
@@ -167,12 +176,18 @@ export default function FootballMatch() {
   const [extraTimeMinutes, setExtraTimeMinutes] = useState<number>(15); // Default extra time is 15 minutes per half
   const [eventsExpanded, setEventsExpanded] = useState(false); // Add back this state
   const [currentTime, setCurrentTime] = useState<number>(0);
+  const [currentSeconds, setCurrentSeconds] = useState<number>(0); // Add seconds state
+  const [serverTimeOffset, setServerTimeOffset] = useState(0);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   
   const clockRef = useRef<NodeJS.Timeout | null>(null);
   const { matchId } = useLocalSearchParams();
   const { currentUser } = useAuth();
   const router = useRouter();
   const db = getFirestore();
+
+  // Add a state variable to track how second half was started
+  const [secondHalfContinued, setSecondHalfContinued] = useState<boolean>(false);
 
   useEffect(() => {
     let unsubscribe: () => void;
@@ -244,6 +259,8 @@ export default function FootballMatch() {
               weather: data.weather || null,
               result: data.result || null,
               clockRunning: data.clockRunning || false,
+              secondHalfContinued: data.secondHalfContinued || false, // Add this line
+              penaltyKicks: data.penaltyKicks || [],
             };
 
             console.log('Team names from loaded data:', matchData.team1.name, matchData.team2.name);
@@ -304,45 +321,154 @@ export default function FootballMatch() {
     }
   }, [matchId]);
 
-  // Update the match time in Firestore with proper timestamp tracking
-  const updateMatchTime = async (time: number) => {
-    const now = Date.now();
-    // Only update if at least 1 second has passed since last update
-    if (now - lastUpdateTime >= 1000) {
-      try {
-        await updateDoc(doc(db, 'matches', matchId as string), {
-          currentTime: time,
-          lastUpdateTimestamp: serverTimestamp()
-        });
-        setLastUpdateTime(now);
-      } catch (error) {
-        console.error('Error updating match time:', error);
-      }
-    }
-  };
-
-  // Handle clock updates
+  // Initialize timer with server time offset when match is loaded
   useEffect(() => {
-    if (match?.status === MatchStatus.IN_PROGRESS && match.clockRunning) {
-      setClockRunning(true);
-      setCurrentTime(match.currentTime);
-      const interval = setInterval(() => {
-        setCurrentTime((prev: number) => {
-          const newTime = prev + 1;
-          updateMatchTime(newTime);
-          return newTime;
-        });
-      }, 1000);
-      setClockInterval(interval);
-    }
+    // Get server/client time offset for accuracy
+    const getServerOffset = () => {
+      const offsetRef = ref(realtimeDb, '.info/serverTimeOffset');
+      onValue(offsetRef, (snapshot) => {
+        const offset = snapshot.val() || 0;
+        setServerTimeOffset(offset);
+      });
+    };
 
+    if (match?.id) {
+      getServerOffset();
+      // Create timer reference in RTDB
+      const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+      // Initialize timer data if it doesn't exist
+      get(timerRef).then((snapshot) => {
+        if (!snapshot.exists()) {
+          // If timer data doesn't exist, create it
+          set(timerRef, {
+            running: match.clockRunning || false,
+            period: match.period,
+            baseTimeSeconds: match.currentTime * 60, // Convert minutes to seconds
+            startedAt: match.clockRunning ? Date.now() : null,
+            extraTime: match.extraTime,
+            secondHalfContinued: match.secondHalfContinued || false
+          });
+          // Set local state to match
+          setClockRunning(match.clockRunning || false);
+          setSecondHalfContinued(match.secondHalfContinued || false);
+        } else {
+          // If timer data exists, sync local state with it
+          const timerData = snapshot.val();
+          setClockRunning(timerData.running || false);
+          setSecondHalfContinued(timerData.secondHalfContinued || false);
+        }
+      });
+    }
+  }, [match?.id]);
+
+  // Listen for timer updates
+  useEffect(() => {
+    if (!match?.id) return;
+    
+    const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+    const unsubscribe = onValue(timerRef, (snapshot) => {
+      const timerData = snapshot.val();
+      if (!timerData) return;
+      
+      // Clear any existing interval
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
+      }
+      
+      // Always update clockRunning state to match the timer's running state from the database
+      setClockRunning(timerData.running);
+      
+      // Sync the secondHalfContinued flag
+      if (timerData.secondHalfContinued !== undefined) {
+        setSecondHalfContinued(timerData.secondHalfContinued);
+      }
+      
+      if (timerData.running) {
+        // Create function to calculate and update time
+        const calculateAndUpdateTime = () => {
+          const now = Date.now() + serverTimeOffset;
+          const elapsedSeconds = (now - timerData.startedAt) / 1000;
+          const totalSeconds = timerData.baseTimeSeconds + elapsedSeconds;
+          const minutes = Math.floor(totalSeconds / 60);
+          const seconds = Math.floor(totalSeconds % 60);
+          
+          // Update both minutes and seconds
+          setCurrentTime(minutes);
+          setCurrentSeconds(seconds);
+          
+          // Update local state without firebase updates
+          setMatch(prev => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              currentTime: minutes,
+              clockRunning: true,
+              secondHalfContinued: timerData.secondHalfContinued
+            };
+          });
+        };
+        
+        // Initial calculation
+        calculateAndUpdateTime();
+        
+        // Set interval for UI updates only
+        timerIntervalRef.current = setInterval(calculateAndUpdateTime, 1000);
+      } else {
+        // Update with the stopped time
+        const minutes = Math.floor(timerData.baseTimeSeconds / 60);
+        const seconds = Math.floor(timerData.baseTimeSeconds % 60);
+        
+        // Update both minutes and seconds
+        setCurrentTime(minutes);
+        setCurrentSeconds(seconds);
+        
+        setMatch(prev => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            currentTime: minutes,
+            clockRunning: false,
+            secondHalfContinued: timerData.secondHalfContinued
+          };
+        });
+      }
+    });
+    
     return () => {
-      if (clockInterval) {
-        clearInterval(clockInterval);
-        setClockInterval(null);
+      unsubscribe();
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
       }
     };
-  }, [match?.status, match?.clockRunning]);
+  }, [match?.id, serverTimeOffset]);
+
+  // Update the match time in Firestore with proper timestamp tracking
+  const updateMatchTime = async (minutes: number, seconds: number) => {
+    if (!match) return;
+    
+    const totalSeconds = (minutes * 60) + seconds;
+    
+    // Update time in RTDB
+    const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+    await update(timerRef, {
+      baseTimeSeconds: totalSeconds
+    });
+    
+    // Continue with the existing Firestore update logic
+    await updateDoc(doc(db, 'matches', matchId as string), {
+      currentTime: minutes // Firestore still stores just minutes for compatibility
+    });
+    
+    setMatch(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        currentTime: minutes
+      };
+    });
+  };
 
   // Fetch team players from Team collection
   const fetchTeamPlayers = async (team1Id: string, team2Id: string) => {
@@ -725,72 +851,177 @@ export default function FootballMatch() {
     return match.status !== MatchStatus.COMPLETED;
   };
 
-  // Start/Stop the match clock with proper Firestore synchronization
+  // Replace the existing toggleClock function
   const toggleClock = async () => {
-    try {
-      if (!match) return;
-
-      // If match is completed, don't allow starting the clock
-      if (!clockRunning && match.status === MatchStatus.COMPLETED) {
-        Alert.alert('Match Completed', 'This match has ended and the clock cannot be started.');
-        return;
-      }
-
-      if (!clockRunning) {
-        // Before starting the clock, check if we need to make any updates based on match status
-        let updatedMatch = { ...match };
-        let statusChanged = false;
-        
-        // If match is not started, set it to in progress and update period
-        if (match.status === MatchStatus.NOT_STARTED) {
-          updatedMatch.status = MatchStatus.IN_PROGRESS;
-          if (match.period === MatchPeriod.NOT_STARTED) {
-            updatedMatch.period = MatchPeriod.FIRST_HALF;
+    if (!match) return;
+    
+    const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+    const snapshot = await get(timerRef);
+    const timerData = snapshot.val() || {
+      running: false,
+      period: match.period,
+      baseTimeSeconds: (match.currentTime * 60) + currentSeconds,
+      extraTime: match.extraTime
+    };
+    
+    // Check if we're in half time and trying to start the clock
+    if (!timerData.running && match.period === MatchPeriod.HALF_TIME) {
+      // Ask user how to proceed to second half
+      Alert.alert(
+        'Start Second Half',
+        'How would you like to start the second half?',
+        [
+          {
+            text: 'Start at 45:00',
+            onPress: async () => {
+              // Transition to second half with reset time
+              const newPeriod = MatchPeriod.SECOND_HALF;
+              
+              // Set the flag to indicate second half starts fresh at 45:00
+              setSecondHalfContinued(false);
+              
+              // Update period in RTDB
+              await update(timerRef, {
+                period: newPeriod,
+                baseTimeSeconds: 0, // Reset to 0 (will display as 45:00)
+                running: true,
+                startedAt: Date.now() + serverTimeOffset,
+                secondHalfContinued: false // Explicitly mark as not continued
+              });
+              
+              // Update Firestore
+              const periodChangeEvent: MatchEvent = {
+                type: MatchEventType.PERIOD_CHANGE,
+                time: 45, // Start at 45 minutes
+                teamId: 'none',
+                playerId: 'none',
+                additionalInfo: getPeriodDisplayName(newPeriod),
+                timestamp: new Date()
+              };
+              
+              await updateDoc(doc(db, 'matches', matchId as string), {
+                period: newPeriod,
+                currentTime: 0, // Reset to 0 in Firestore
+                clockRunning: true,
+                events: arrayUnion(periodChangeEvent),
+                secondHalfContinued: false // Explicitly mark as not continued
+              });
+              
+              // Update local state
+              setCurrentTime(0);
+              setCurrentSeconds(0);
+              setClockRunning(true);
+              
+              setMatch(prev => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  period: newPeriod,
+                  currentTime: 0,
+                  clockRunning: true,
+                  events: [...prev.events, periodChangeEvent],
+                  secondHalfContinued: false // Explicitly mark as not continued
+                };
+              });
+            }
+          },
+          {
+            text: 'Continue from current time',
+            onPress: async () => {
+              // Transition to second half keeping current time
+              const newPeriod = MatchPeriod.SECOND_HALF;
+              
+              // Set the flag to indicate second half continues from current time
+              setSecondHalfContinued(true);
+              
+              // Get the exact current time in seconds
+              const totalCurrentSeconds = timerData.baseTimeSeconds;
+              
+              // Update period in RTDB
+              await update(timerRef, {
+                period: newPeriod,
+                running: true,
+                baseTimeSeconds: totalCurrentSeconds, // Keep exactly the same time
+                startedAt: Date.now() + serverTimeOffset,
+                secondHalfContinued: true // Store this info in the database too
+              });
+              
+              // Update Firestore
+              const periodChangeEvent: MatchEvent = {
+                type: MatchEventType.PERIOD_CHANGE,
+                time: currentTime + (currentSeconds / 60),
+                teamId: 'none',
+                playerId: 'none',
+                additionalInfo: getPeriodDisplayName(newPeriod),
+                timestamp: new Date()
+              };
+              
+              // Update Firestore with current time in minutes
+              const minutes = Math.floor(totalCurrentSeconds / 60);
+              await updateDoc(doc(db, 'matches', matchId as string), {
+                period: newPeriod,
+                clockRunning: true,
+                currentTime: minutes, // Keep current time in minutes
+                events: arrayUnion(periodChangeEvent),
+                secondHalfContinued: true // Store this info in Firestore too
+              });
+              
+              // Update local state
+              setClockRunning(true);
+              
+              setMatch(prev => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  period: newPeriod,
+                  currentTime: minutes, // Update with current minutes
+                  clockRunning: true,
+                  events: [...prev.events, periodChangeEvent],
+                  secondHalfContinued: true // Update in match state
+                };
+              });
+            }
           }
-          statusChanged = true;
-        }
-        
-        // If we're in half time and starting clock, automatically move to second half
-        if (match.period === MatchPeriod.HALF_TIME) {
-          updatedMatch.period = MatchPeriod.SECOND_HALF;
-          updatedMatch.periodEndNotified = false;
-          statusChanged = true;
-        }
-        
-        // If we're in extra time break and starting clock, move to second half of extra time
-        if (match.period === MatchPeriod.EXTRA_TIME_BREAK) {
-          updatedMatch.period = MatchPeriod.EXTRA_TIME_SECOND;
-          updatedMatch.periodEndNotified = false;
-          statusChanged = true;
-        }
-        
-        // Update match if necessary
-        if (statusChanged) {
-          setMatch(updatedMatch);
-          
-          await updateDoc(doc(db, 'matches', matchId as string), {
-            status: updatedMatch.status,
-            period: updatedMatch.period,
-            periodEndNotified: false,
-            clockRunning: true,
-            lastUpdated: new Date()
-          });
-        }
-        
-        // Start the clock
-        setClockRunning(true);
-        setLastUpdateTime(Date.now());
-      } else {
-        // Stopping the clock
-        setClockRunning(false);
-        await updateDoc(doc(db, 'matches', matchId as string), {
-          clockRunning: false,
-          lastUpdated: new Date()
-        });
-      }
-    } catch (error) {
-      console.error('Error toggling clock:', error);
-      Alert.alert('Error', 'Failed to update match status');
+        ],
+        { cancelable: true }
+      );
+      return;
+    }
+    
+    // Normal toggle clock logic for other periods
+    if (!timerData.running) {
+      // Start the clock
+      await update(timerRef, {
+        running: true,
+        startedAt: Date.now() + serverTimeOffset
+      });
+      
+      // Also update Firestore for compatibility with existing code
+      await updateDoc(doc(db, 'matches', matchId as string), {
+        clockRunning: true
+      });
+      
+      setClockRunning(true);
+    } else {
+      // Stop the clock and update the base time
+      const now = Date.now() + serverTimeOffset;
+      const elapsedSeconds = (now - timerData.startedAt) / 1000;
+      const newBaseTime = timerData.baseTimeSeconds + elapsedSeconds;
+      
+      await update(timerRef, {
+        running: false,
+        baseTimeSeconds: newBaseTime,
+        startedAt: null
+      });
+      
+      // Update Firestore with new time and clock state
+      const minutes = Math.floor(newBaseTime / 60);
+      await updateDoc(doc(db, 'matches', matchId as string), {
+        clockRunning: false,
+        currentTime: minutes
+      });
+      
+      setClockRunning(false);
     }
   };
 
@@ -882,127 +1113,98 @@ export default function FootballMatch() {
     }
   };
 
+  // Update the handlePeriodChange function
   const handlePeriodChange = async (newPeriod: MatchPeriod) => {
     if (!match) return;
-
-    try {
-      // Create a period change event
-      const periodChangeEvent: MatchEvent = {
-        type: MatchEventType.PERIOD_CHANGE,
-        time: match.currentTime,
-        teamId: 'none', // No specific team for period changes
-        playerId: 'none', // No specific player for period changes
-        additionalInfo: getPeriodDisplayName(newPeriod),
-        timestamp: new Date()
-      };
-
-      // Check if scores are tied when moving to full time
-      if (newPeriod === MatchPeriod.FULL_TIME && match.team1.score === match.team2.score) {
-        // Ask if they want to go to extra time, skip it, or go directly to penalties
-        Alert.alert(
-          'Match Tied',
-          'The scores are level at full time. How would you like to proceed?',
-          [
-            {
-              text: 'End match',
-              onPress: async () => {
-                // Complete the match
-                await completeMatch(newPeriod);
-              }
-            },
-            {
-              text: 'Go to penalties',
-              onPress: async () => {
-                await updatePeriodInDatabase(MatchPeriod.PENALTIES);
-              }
-            },
-            {
-              text: 'Extra time',
-              onPress: async () => {
-                // Show dialog to adjust extra time minutes
-                // Use a custom prompt since Alert.prompt isn't available on all platforms
-                Alert.alert(
-                  'Extra Time Duration',
-                  `Set minutes per half (default: ${extraTimeMinutes})`,
-                  [
-                    {
-                      text: 'Cancel',
-                      style: 'cancel'
-                    },
-                    {
-                      text: 'Use default',
-                      onPress: async () => {
-                        // Use the default extra time value
-                        
-                        // Update extra time in match
-                        const matchRef = doc(db, 'matches', matchId as string);
-                        await updateDoc(matchRef, {
-                          extraTime: extraTimeMinutes
-                        });
-                        
-                        // Update local match state
-                        setMatch({
-                          ...match,
-                          extraTime: extraTimeMinutes
-                        });
-                        
-                        // Proceed to extra time
-                        await proceedToExtraTime();
-                      }
-                    },
-                    {
-                      text: 'Custom',
-                      onPress: async () => {
-                        // Show another modal or use a different approach to get user input
-                        // For simplicity, we'll use a predefined set of options
-                        Alert.alert(
-                          'Select Extra Time Duration',
-                          'Minutes per half:',
-                          [
-                            { text: '5 minutes', onPress: async () => await setExtraTimeAndProceed(5) },
-                            { text: '10 minutes', onPress: async () => await setExtraTimeAndProceed(10) },
-                            { text: '15 minutes', onPress: async () => await setExtraTimeAndProceed(15) },
-                            { text: '20 minutes', onPress: async () => await setExtraTimeAndProceed(20) },
-                            { text: 'Cancel', style: 'cancel' }
-                          ]
-                        );
-                      }
-                    }
-                  ]
-                );
-              }
-            }
-          ],
-          { cancelable: false }
-        );
-        return; // Exit here, as we'll continue based on user choice
-      } 
-
-      // Normal period change for non-tied full time
-      await updatePeriodInDatabase(newPeriod);
-    } catch (error) {
-      console.error('Error changing period:', error);
-      Alert.alert('Error', 'Failed to update match period');
+    
+    // First stop the clock if running
+    const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+    const snapshot = await get(timerRef);
+    const timerData = snapshot.val();
+    
+    if (timerData && timerData.running) {
+      // Calculate final time for current period
+      const now = Date.now() + serverTimeOffset;
+      const elapsedSeconds = (now - timerData.startedAt) / 1000;
+      const finalSeconds = timerData.baseTimeSeconds + elapsedSeconds;
+      
+      // Set the appropriate base time for each period
+      let newBaseTime = finalSeconds; // Default to current time
+      
+      // Set specific times for different period transitions
+      // Don't reset for SECOND_HALF since user will decide in toggleClock
+      if (newPeriod === MatchPeriod.EXTRA_TIME_FIRST) {
+        // First extra time starts at 0 seconds (will display as 90:00)
+        newBaseTime = 0;
+      } else if (newPeriod === MatchPeriod.EXTRA_TIME_SECOND) {
+        // Second extra time starts at 0 seconds (will display as 105:00)
+        newBaseTime = 0;
+      }
+      
+      await update(timerRef, {
+        running: false,
+        period: newPeriod,
+        baseTimeSeconds: newBaseTime,
+        startedAt: null
+      });
+      
+      // Explicitly set clockRunning state to false
+      setClockRunning(false);
+    } else if (timerData) {
+      // Set the appropriate base time for each period
+      let newBaseTime = timerData.baseTimeSeconds; // Default to current time
+      
+      // Set specific times for different period transitions
+      // Don't reset for SECOND_HALF since user will decide in toggleClock
+      if (newPeriod === MatchPeriod.EXTRA_TIME_FIRST) {
+        // First extra time starts at 0 seconds (will display as 90:00)
+        newBaseTime = 0;
+      } else if (newPeriod === MatchPeriod.EXTRA_TIME_SECOND) {
+        // Second extra time starts at 0 seconds (will display as 105:00)
+        newBaseTime = 0;
+      }
+      
+      await update(timerRef, {
+        period: newPeriod,
+        baseTimeSeconds: newBaseTime
+      });
     }
+    
+    // Update current time and seconds state to match the period change
+    if (newPeriod === MatchPeriod.EXTRA_TIME_FIRST || 
+        newPeriod === MatchPeriod.EXTRA_TIME_SECOND) {
+      setCurrentTime(0);
+      setCurrentSeconds(0);
+    }
+    
+    // Continue with the existing Firestore update logic
+    await updatePeriodInDatabase(newPeriod);
   };
 
-  // Helper function to set extra time and proceed
+  // Update the setExtraTimeAndProceed function to work with RTDB
   const setExtraTimeAndProceed = async (minutes: number) => {
-    setExtraTimeMinutes(minutes);
+    if (!match) return;
     
-    // Update extra time in match
-    const matchRef = doc(db, 'matches', matchId as string);
-    await updateDoc(matchRef, {
+    // Update extra time in RTDB
+    const timerRef = ref(realtimeDb, `matchTimers/${match.id}`);
+    await update(timerRef, {
       extraTime: minutes
     });
     
-    // Update local match state
-    setMatch({
-      ...match!,
+    // Continue with the existing Firestore update logic
+    await updateDoc(doc(db, 'matches', matchId as string), {
       extraTime: minutes
     });
     
-    // Proceed to extra time
+    setMatch(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        extraTime: minutes
+      };
+    });
+    
+// Continue with existing proceedToNextPeriod logic
     await proceedToExtraTime();
   };
 
@@ -1056,10 +1258,16 @@ export default function FootballMatch() {
     // Determine match result
     const matchResult = getMatchResult();
 
+    // For penalties, ensure we record that it was decided by penalties
+    let finalPeriod = newPeriod;
+    if (match?.period === MatchPeriod.PENALTIES) {
+      finalPeriod = MatchPeriod.PENALTIES; // Ensure we keep track of penalties
+    }
+
     // Update match with completed status
     const matchRef = doc(db, 'matches', matchId as string);
     await updateDoc(matchRef, {
-      period: newPeriod,
+      period: finalPeriod,
       events: arrayUnion(periodChangeEvent),
       periodEndNotified: false,
       status: MatchStatus.COMPLETED,
@@ -1069,7 +1277,7 @@ export default function FootballMatch() {
     // Update local match state
     setMatch({
       ...match!,
-      period: newPeriod,
+      period: finalPeriod,
       events: [...match!.events, periodChangeEvent],
       periodEndNotified: false,
       status: MatchStatus.COMPLETED,
@@ -1126,9 +1334,15 @@ export default function FootballMatch() {
       return `${match.team2.name} wins ${match.team2.score}-${match.team1.score}`;
     } else {
       if (match.period === MatchPeriod.PENALTIES) {
-        // If in penalties, we need additional logic for penalty shootout winner
-        // For now, we'll return a draw with note about penalties
-        return `Draw ${match.team1.score}-${match.team2.score} (penalties)`;
+        // In penalties, the scores in team1.score and team2.score represent the penalty scores
+        // This should be explicitly chosen by the user by updating the scores during penalties
+        if (match.team1.score > match.team2.score) {
+          return `${match.team1.name} wins ${match.team1.score}-${match.team2.score} on penalties`;
+        } else if (match.team2.score > match.team1.score) {
+          return `${match.team2.name} wins ${match.team2.score}-${match.team1.score} on penalties`;
+        } else {
+          return `Draw ${match.team1.score}-${match.team2.score} (penalties unresolved)`;
+        }
       }
       return `Draw ${match.team1.score}-${match.team2.score}`;
     }
@@ -1138,23 +1352,31 @@ export default function FootballMatch() {
   const updatePeriodInDatabase = async (newPeriod: MatchPeriod) => {
     const periodChangeEvent: MatchEvent = {
       type: MatchEventType.PERIOD_CHANGE,
-      time: match!.currentTime,
+      time: currentTime + (currentSeconds / 60),
       teamId: 'none',
       playerId: 'none',
       additionalInfo: getPeriodDisplayName(newPeriod),
       timestamp: new Date()
     };
 
-    // Check if we're moving to a completed state
-    const isCompleted = 
-      newPeriod === MatchPeriod.FULL_TIME || 
-      newPeriod === MatchPeriod.PENALTIES;
-      
-    // Set new match status based on period
-    const newMatchStatus = isCompleted ? MatchStatus.COMPLETED : match!.status;
+    // Check if the teams have equal scores (draw)
+    const isDrawMatch = match && match.team1.score === match.team2.score;
     
-    // If the match is completed, determine the result
-    const matchResult = isCompleted ? getMatchResult() : undefined;
+    // Check if we're moving to a potentially completed state
+    const isPotentiallyCompleted = 
+      newPeriod === MatchPeriod.FULL_TIME;
+      
+    // Only mark as completed if:
+    // We're at FULL_TIME and scores are NOT equal (no need for extra time)
+    // Note: We're removing automatic completion for PENALTIES to allow recording penalty results
+    const isActuallyCompleted = 
+      (newPeriod === MatchPeriod.FULL_TIME && !isDrawMatch);
+      
+    // Set new match status based on whether it's actually completed
+    const newMatchStatus = isActuallyCompleted ? MatchStatus.COMPLETED : match!.status;
+    
+    // If the match is actually completed, determine the result
+    const matchResult = isActuallyCompleted ? getMatchResult() : undefined;
     
     // Update match with new period and the period change event
     const matchRef = doc(db, 'matches', matchId as string);
@@ -1176,8 +1398,41 @@ export default function FootballMatch() {
       ...(matchResult && { result: matchResult })
     });
 
+    // If arriving at FULL_TIME with a draw, show extra time/penalties options
+    if (newPeriod === MatchPeriod.FULL_TIME && isDrawMatch) {
+      Alert.alert(
+        'Match Ended in a Draw',
+        'How would you like to proceed with this draw match?',
+        [
+          {
+            text: 'Proceed to Extra Time',
+            onPress: async () => {
+              // Auto-transition to extra time
+              await handlePeriodChange(MatchPeriod.EXTRA_TIME_FIRST);
+            }
+          },
+          {
+            text: 'Go to Penalties',
+            onPress: async () => {
+              // Skip to penalties
+              await handlePeriodChange(MatchPeriod.PENALTIES);
+            }
+          },
+          {
+            text: 'End as Draw',
+            style: 'destructive',
+            onPress: async () => {
+              // Complete match as a draw
+              await completeMatch(MatchPeriod.FULL_TIME);
+            }
+          }
+        ]
+      );
+      return;
+    }
+
     // If match is now completed, update team statistics and tournament data
-    if (isCompleted) {
+    if (isActuallyCompleted) {
       // If this match is part of a tournament, update the LiveMatch record
       if (match?.tournamentId && matchResult) {
         try {
@@ -1221,7 +1476,7 @@ export default function FootballMatch() {
     if (
       newPeriod === MatchPeriod.HALF_TIME || 
       newPeriod === MatchPeriod.FULL_TIME || 
-      newPeriod === MatchPeriod.EXTRA_TIME_BREAK ||
+      newPeriod === MatchPeriod.EXTRA_TIME_BREAK || 
       newPeriod === MatchPeriod.PENALTIES
     ) {
       setClockRunning(false);
@@ -1496,10 +1751,68 @@ export default function FootballMatch() {
   );
 
   // Format time display
-  const formatTime = (time: number): string => {
-    const minutes = Math.floor(time);
-    const seconds = Math.floor((time - minutes) * 60);
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  const formatTime = (minutes: number, seconds: number): string => {
+    // Handle time display based on match periods
+    let displayMinutes = minutes;
+    let displaySeconds = seconds;
+    let extraTimeSymbol = '';
+    
+    switch (match?.period) {
+      case MatchPeriod.FIRST_HALF:
+    // First half injury time
+        if (minutes >= 45) {
+      displayMinutes = 45;
+      extraTimeSymbol = '+' + (minutes - 45);
+    } 
+        break;
+        
+      case MatchPeriod.SECOND_HALF:
+        // Check if we're continuing from first half or started at 45:00
+        if (secondHalfContinued || (match?.secondHalfContinued === true)) {
+          // Case: Continue from current time - keep actual time without modifying
+          displayMinutes = minutes;
+          
+          // Still handle injury time after 90 minutes
+          if (minutes >= 90) {
+      displayMinutes = 90;
+      extraTimeSymbol = '+' + (minutes - 90);
+    }
+        } else {
+          // Case: Started second half at 0 - display as 45+minutes
+          displayMinutes = 45 + minutes;
+        }
+        break;
+        
+      case MatchPeriod.EXTRA_TIME_FIRST:
+        // First half of extra time
+        if (minutes >= 15) {
+          displayMinutes = 105;
+      extraTimeSymbol = '+' + (minutes - 15);
+        } else {
+          // Display as 90+minutes
+          displayMinutes = 90 + minutes;
+        }
+        break;
+        
+      case MatchPeriod.EXTRA_TIME_SECOND:
+        // Second half of extra time
+        if (minutes >= 15) {
+          displayMinutes = 120;
+          extraTimeSymbol = '+' + (minutes - 15);
+        } else {
+          // Display as 105+minutes
+          displayMinutes = 105 + minutes;
+        }
+        break;
+    }
+    
+    // If we're showing extra time (injury time)
+    if (extraTimeSymbol) {
+      return `${displayMinutes}${extraTimeSymbol}:${displaySeconds.toString().padStart(2, '0')}`;
+    }
+    
+    // Normal time display
+    return `${displayMinutes}:${displaySeconds.toString().padStart(2, '0')}`;
   };
 
   // Get player name by ID
@@ -2156,6 +2469,58 @@ export default function FootballMatch() {
     );
   }
 
+  // Add transitions between extra time periods
+  const handleExtraTimePeriodTransition = async () => {
+    if (!match) return;
+    
+    if (match.period === MatchPeriod.EXTRA_TIME_FIRST) {
+      // When first half of extra time ends, go to extra time break
+      await handlePeriodChange(MatchPeriod.EXTRA_TIME_BREAK);
+      
+      // Notify user
+      Alert.alert(
+        'Extra Time - Half Time',
+        'The first half of extra time has ended. Click start to begin the second half of extra time.',
+        [
+          {
+            text: 'Continue',
+            onPress: async () => {
+              // Auto-transition to second half of extra time
+              await handlePeriodChange(MatchPeriod.EXTRA_TIME_SECOND);
+            }
+          }
+        ]
+      );
+    } else if (match.period === MatchPeriod.EXTRA_TIME_SECOND) {
+      // When second half of extra time ends, handle draw or completion
+      if (match.team1.score === match.team2.score) {
+        // Still a draw after extra time, go to penalties
+        Alert.alert(
+          'Extra Time Ended - Still a Draw',
+          'The match is still tied after extra time. Proceed to penalties?',
+          [
+            {
+              text: 'Go to Penalties',
+              onPress: async () => {
+                await handlePeriodChange(MatchPeriod.PENALTIES);
+              }
+            },
+            {
+              text: 'End as Draw',
+              style: 'destructive',
+              onPress: async () => {
+                await completeMatch(MatchPeriod.FULL_TIME);
+              }
+            }
+          ]
+        );
+      } else {
+        // Not a draw, complete the match
+        await completeMatch(MatchPeriod.FULL_TIME);
+      }
+    }
+  };
+
   return (
     <ScrollView style={styles.container}>
       {/* Match Header & Scorecard */}
@@ -2191,7 +2556,7 @@ export default function FootballMatch() {
             {match.period.replace(/_/g, ' ')}
           </Text>
           <View style={styles.timeContainer}>
-            <Text style={styles.timeText}>{Math.floor(match.currentTime)}'</Text>
+            <Text style={styles.timeText}>{formatTime(currentTime, currentSeconds)}</Text>
             <TouchableOpacity 
               style={styles.clockButton}
               onPress={toggleClock}
@@ -2317,7 +2682,7 @@ export default function FootballMatch() {
             <Text style={{color: '#FF9F45', fontSize: 12}}>
               {match.period === MatchPeriod.NOT_STARTED ? 'Not Started' : 
                match.period === MatchPeriod.FULL_TIME ? 'Final' : 
-               `${Math.floor(match.currentTime)}'`}
+               `${Math.floor(currentTime)}:${currentSeconds < 10 ? '0' : ''}${currentSeconds}`}
             </Text>
           </View>
         </View>
@@ -2357,7 +2722,7 @@ export default function FootballMatch() {
               {match.period !== MatchPeriod.NOT_STARTED && match.period !== MatchPeriod.FULL_TIME && (
                 <View style={{
                   position: 'absolute',
-                  left: `${Math.min((match.currentTime / 90) * 100, 100)}%`,
+                  left: `${Math.min((currentTime / 90) * 100, 100)}%`,
                   height: 12,
                   width: 3,
                   backgroundColor: '#FF9F45',
@@ -2653,6 +3018,7 @@ export default function FootballMatch() {
       {/* Extra Time Controls */}
       {match.period === MatchPeriod.FULL_TIME && match.team1.score === match.team2.score && (
         <View style={styles.periodControls}>
+          <Text style={styles.sectionTitle}>Draw Match Options</Text>
           <TouchableOpacity
             style={styles.periodButton}
             onPress={() => handlePeriodChange(MatchPeriod.EXTRA_TIME_FIRST)}
@@ -2663,7 +3029,7 @@ export default function FootballMatch() {
               end={{ x: 1, y: 0 }}
               style={styles.periodGradient}
             >
-              <Text style={styles.periodButtonText}>ET First Half</Text>
+              <Text style={styles.periodButtonText}>Start Extra Time</Text>
             </LinearGradient>
           </TouchableOpacity>
 
@@ -2677,7 +3043,217 @@ export default function FootballMatch() {
               end={{ x: 1, y: 0 }}
               style={styles.periodGradient}
             >
-              <Text style={styles.periodButtonText}>Penalties</Text>
+              <Text style={styles.periodButtonText}>Go to Penalties</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+          
+          <TouchableOpacity
+            style={styles.periodButton}
+            onPress={() => completeMatch(MatchPeriod.FULL_TIME)}
+          >
+            <LinearGradient
+              colors={['#FF4545', '#FF9F45']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.periodGradient}
+            >
+              <Text style={styles.periodButtonText}>End as Draw</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {/* Extra Time First Half Controls */}
+      {match.period === MatchPeriod.EXTRA_TIME_FIRST && (
+        <View style={styles.periodControls}>
+          <Text style={styles.sectionTitle}>Extra Time - First Half</Text>
+          <TouchableOpacity
+            style={styles.periodButton}
+            onPress={() => handlePeriodChange(MatchPeriod.EXTRA_TIME_BREAK)}
+          >
+            <LinearGradient
+              colors={['#FF9F45', '#D494FF']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.periodGradient}
+            >
+              <Text style={styles.periodButtonText}>End First Half</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {/* Extra Time Break Controls */}
+      {match.period === MatchPeriod.EXTRA_TIME_BREAK && (
+        <View style={styles.periodControls}>
+          <Text style={styles.sectionTitle}>Extra Time - Break</Text>
+          <TouchableOpacity
+            style={styles.periodButton}
+            onPress={() => handlePeriodChange(MatchPeriod.EXTRA_TIME_SECOND)}
+          >
+            <LinearGradient
+              colors={['#FF9F45', '#D494FF']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.periodGradient}
+            >
+              <Text style={styles.periodButtonText}>Start Second Half</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {/* Extra Time Second Half Controls */}
+      {match.period === MatchPeriod.EXTRA_TIME_SECOND && (
+        <View style={styles.periodControls}>
+          <Text style={styles.sectionTitle}>Extra Time - Second Half</Text>
+          <TouchableOpacity
+            style={styles.periodButton}
+            onPress={() => {
+              if (match.team1.score === match.team2.score) {
+                // Still a draw, show options
+                Alert.alert(
+                  'Extra Time Ended - Still a Draw',
+                  'The match is still tied after extra time. How would you like to proceed?',
+                  [
+                    {
+                      text: 'Go to Penalties',
+                      onPress: () => handlePeriodChange(MatchPeriod.PENALTIES)
+                    },
+                    {
+                      text: 'End as Draw',
+                      style: 'destructive',
+                      onPress: () => completeMatch(MatchPeriod.FULL_TIME)
+                    }
+                  ]
+                );
+              } else {
+                // Not a draw, complete the match
+                completeMatch(MatchPeriod.FULL_TIME);
+              }
+            }}
+          >
+            <LinearGradient
+              colors={['#FF9F45', '#D494FF']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.periodGradient}
+            >
+              <Text style={styles.periodButtonText}>End Extra Time</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {/* Penalties Controls */}
+      {match.period === MatchPeriod.PENALTIES && (
+        <View style={styles.periodControls}>
+          <Text style={styles.sectionTitle}>Penalty Shootout</Text>
+          
+          {/* Add controls for recording penalty scores */}
+          <View style={styles.penaltyScoreContainer}>
+            <View style={styles.teamPenaltyControls}>
+              <Text style={styles.teamName}>{match.team1.name}</Text>
+              <View style={styles.scoreControls}>
+                <TouchableOpacity
+                  style={styles.scoreButton}
+                  onPress={async () => {
+                    if (match.team1.score > 0) {
+                      const newScore = match.team1.score - 1;
+                      await updateDoc(doc(db, 'matches', matchId as string), {
+                        'team1.score': newScore
+                      });
+                      setMatch({
+                        ...match,
+                        team1: {
+                          ...match.team1,
+                          score: newScore
+                        }
+                      });
+                    }
+                  }}
+                >
+                  <Text style={styles.scoreButtonText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.penaltyScore}>{match.team1.score}</Text>
+                <TouchableOpacity
+                  style={styles.scoreButton}
+                  onPress={async () => {
+                    const newScore = match.team1.score + 1;
+                    await updateDoc(doc(db, 'matches', matchId as string), {
+                      'team1.score': newScore
+                    });
+                    setMatch({
+                      ...match,
+                      team1: {
+                        ...match.team1,
+                        score: newScore
+                      }
+                    });
+                  }}
+                >
+                  <Text style={styles.scoreButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            
+            <View style={styles.teamPenaltyControls}>
+              <Text style={styles.teamName}>{match.team2.name}</Text>
+              <View style={styles.scoreControls}>
+                <TouchableOpacity
+                  style={styles.scoreButton}
+                  onPress={async () => {
+                    if (match.team2.score > 0) {
+                      const newScore = match.team2.score - 1;
+                      await updateDoc(doc(db, 'matches', matchId as string), {
+                        'team2.score': newScore
+                      });
+                      setMatch({
+                        ...match,
+                        team2: {
+                          ...match.team2,
+                          score: newScore
+                        }
+                      });
+                    }
+                  }}
+                >
+                  <Text style={styles.scoreButtonText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.penaltyScore}>{match.team2.score}</Text>
+                <TouchableOpacity
+                  style={styles.scoreButton}
+                  onPress={async () => {
+                    const newScore = match.team2.score + 1;
+                    await updateDoc(doc(db, 'matches', matchId as string), {
+                      'team2.score': newScore
+                    });
+                    setMatch({
+                      ...match,
+                      team2: {
+                        ...match.team2,
+                        score: newScore
+                      }
+                    });
+                  }}
+                >
+                  <Text style={styles.scoreButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={styles.periodButton}
+            onPress={() => completeMatch(MatchPeriod.PENALTIES)}
+          >
+            <LinearGradient
+              colors={['#FF4545', '#FF9F45']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.periodGradient}
+            >
+              <Text style={styles.periodButtonText}>Complete Match</Text>
             </LinearGradient>
           </TouchableOpacity>
         </View>
@@ -3957,5 +4533,38 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 14,
     textAlign: 'center',
+  },
+  penaltyScoreContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  teamPenaltyControls: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  scoreControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  scoreButton: {
+    width: 36,
+    height: 36,
+    backgroundColor: '#333',
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginHorizontal: 10,
+  },
+  scoreButtonText: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  penaltyScore: {
+    color: '#FFFFFF',
+    fontSize: 24,
+    fontWeight: 'bold',
   },
 }); 
