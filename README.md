@@ -1,54 +1,84 @@
-# Welcome to your Expo app 👋
+# Triblet Sports Tournament & Game Management App
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Triblet is a comprehensive **sports tournament and game management** mobile application. It allows organizers and players to create and manage tournaments, teams, and matches all in one place. Key features include real-time score updates, automatic leaderboard and standings calculations, and dynamic team/player management. The appâ€™s goal is to streamline tournament workflows (scheduling games, tracking scores, and ranking teams) to make hosting sports events easier and more engaging. 
 
-## Get started
+## Features
 
-1. Install dependencies
+- **Intuitive Mobile Interface:** Tribal offers a clean, user-friendly interface (built with React Native) for creating tournaments, adding teams, and recording game results.  
+- **Live Updates & Notifications:** Match scores and results update in real-time, ensuring all participants stay informed instantly.  
+- **Automated Leaderboards:** Standings and rankings are calculated automatically based on game results, so users always see up-to-date team standings.  
+- **Team & Player Management:** Create and manage teams or individual players, assign them to tournaments, and view rosters and statistics.  
+- **Flexible Tournament Formats:** Supports different tournament styles (round-robin, knockout, etc.) and game types, making it adaptable to various sports or competitions.  
+- **Data Persistence:** Uses a backend (e.g. Firebase or Node.js/Express API) to store tournament data, scores, and user information securely.  
+- **Authentication & Profiles:** Includes user authentication (email/password, OAuth, etc.) so organizers and players can have profiles and personalized access.  
 
-   ```bash
-   npm install
-   npx expo install expo-image-picker
-   npm install @react-native-community/datetimepicker@7.6.2
-   npx expo install @react-native-picker/picker
-   ```
+## Tech Stack
 
-2. Start the app
+- **React Native (Expo):** For cross-platform mobile development  
+- **Backend API:** Node.js/Express or Firebase functions  
+- **Database:** Firebase Firestore or Realtime DB  
+- **State Management:** React Context or Redux  
+- **Navigation:** React Navigation  
+- **Notifications:** Firebase Cloud Messaging or Expo Notifications  
+- **Dev Tools:** npm/Yarn, Git, ESLint, Prettier
 
-   ```bash
-    npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Installation
 
 ```bash
-npm run reset-project
+git clone https://github.com/aathifpm/Triblet.git
+cd Triblet
+npm install
+# or
+yarn install
+cp .env.example .env
+# Edit .env with your config
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+If backend exists:
+```bash
+cd server
+npm install
+npm start
+```
 
-## Learn more
+To start the app:
+```bash
+cd ../
+expo start
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+## Usage
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+1. Register/Login  
+2. Create Tournament  
+3. Add Teams/Players  
+4. Schedule Matches  
+5. Enter Scores  
+6. View Live Standings  
+7. Get Notifications  
 
-## Join the community
+Use Expo Go or simulator to test:
+```bash
+expo start
+```
 
-Join our community of developers creating universal apps.
+## Project Structure
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
-  "# Triblet"
+```
+Triblet/
+app/ or src/
+components/
+screens/
+assets/
+App.js
+.env.sample
+ package.json
+ README.md
+```
+
+## License
+
+This project is **not open source** and is **not licensed for public use**.  
+You may **not copy, modify, distribute, or use** any part of this code or associated resources without **explicit written permission** from the project maintainer.
+
+For inquiries, please contact the maintainer directly.
